@@ -1,0 +1,310 @@
+import os
+import sys
+import json
+import time
+import asyncio
+import logging
+import threading
+import hashlib
+import requests
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from tenacity import retry, stop_after_attempt, wait_exponential
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from dotenv import load_dotenv
+import pyupbit
+from openai import OpenAI
+import ta
+import telegram
+from telegram import Bot
+from filelock import FileLock
+
+# API 키 설정
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+UPBIT_ACCESS_KEY = os.getenv("UPBIT_ACCESS_KEY")
+UPBIT_SECRET_KEY = os.getenv("UPBIT_SECRET_KEY")
+
+async def find_trading_opportunities(self):
+        self.opportunities = await self.market_analyzer.scan_for_opportunities()
+        logger.info(f"{len(self.opportunities)}개의 거래 기회 발견")
+
+    async def dollar_cost_averaging(self, ticker):
+        try:
+            position = self.stop_loss_manager.positions.get(ticker)
+            if not position:
+                logger.warning(f"{ticker} 포지션이 없어 DCA 실행 불가")
+                return False
+
+            current_price = pyupbit.get_current_price(ticker)
+            if not current_price:
+                logger.error(f"{ticker} 현재 가격 가져오기 실패")
+                return False
+
+            profit_percent = ((current_price - position['entry_price']) / position['entry_price']) * 100
+            if profit_percent > -3:
+                logger.info(f"{ticker} 손실률 {profit_percent:.2f}%로 DCA 조건 미충족")
+                return False
+
+            krw_balance = upbit.get_balance("KRW")
+            if krw_balance is None or krw_balance < MIN_KRW_BALANCE:
+                logger.info(f"KRW 잔고 부족: {krw_balance if krw_balance else '없음'}원")
+                return False
+
+            budget = krw_balance * self.dca_ratio
+            amount = budget / current_price
+
+            logger.info(f"{ticker} 평단 하향 매수 시도: 예산={budget:,.0f}원, 현재가={current_price:,.2f}원")
+            buy_order = upbit.buy_market_order(ticker, budget)
+
+            if buy_order and "uuid" in buy_order:
+                order_uuid = buy_order["uuid"]
+                order_info = upbit.get_order(order_uuid)
+                for _ in range(10):
+                    if order_info and order_info["state"] in ["done", "cancel"]:
+                        break
+                    await asyncio.sleep(1)
+                    order_info = upbit.get_order(order_uuid)
+
+                executed_amount = float(order_info.get("executed_volume", 0)) if order_info else 0
+                if executed_amount > 0:
+                    executed_price = current_price
+                    reason = f"DCA: 손실률 {profit_percent:.2f}%"
+                    await self.trading_history.add_trade(ticker, "buy", executed_price, executed_amount, reason)
+
+                    total_amount = position['amount'] + executed_amount
+                    total_cost = (position['amount'] * position['entry_price']) + (executed_amount * executed_price)
+                    new_avg_price = total_cost / total_amount if total_amount > 0 else executed_price
+                    self.stop_loss_manager.update_position(ticker, new_avg_price=new_avg_price, amount=total_amount)
+
+                    logger.info(f"{ticker} DCA 매수 완료: 가격={executed_price:,.2f}원, 수량={executed_amount:.8f}개")
+                    message = (
+                        f"💡 평단 하향 매수: {ticker}\n"
+                        f"가격: {executed_price:,.2f}원\n"
+                        f"수량: {executed_amount:.8f}개\n"
+                        f"총 금액: {executed_amount * executed_price:,.0f}원\n"
+                        f"사유: {reason}"
+                    )
+                    await async_send_telegram_message(message)
+                    return True
+                else:
+                    logger.error(f"{ticker} DCA 매수 미체결: {order_info}")
+                    return False
+            else:
+                logger.error(f"{ticker} DCA 주문 실패: {buy_order or '응답 없음'}")
+                return False
+        except Exception as e:
+            logger.error(f"{ticker} DCA 실행 실패: {e}")
+            return False
+
+
+async def execute_sell_strategy(self):
+        """AI 기반 자동 매도 전략 실행"""
+        try:
+            if not self.purchased_coins["coins"]:
+                logger.info("보유 코인 없음, 매도 전략 건너뜀")
+                return
+
+            market_analysis = self.market_analyzer.ai_analyze_market()
+            if market_analysis is None:
+                logger.info("시장 분석 실패, 매도 전략 중단")
+                return
+
+            try:
+                sell_ratio = float(market_analysis.get("sell_ratio", "0%").strip("%"))
+                risk_level = int(market_analysis.get("risk_level", 5))
+            except (ValueError, TypeError) as e:
+                logger.error(f"매도 비율 또는 위험 수준 형식 오류: {market_analysis}, 기본값 사용")
+                sell_ratio = 0
+                risk_level = 5
+
+            for ticker in self.purchased_coins["coins"][:]:
+                if not rate_limiter.can_make_api_call():
+                    await asyncio.sleep(0.1)
+                    continue
+
+                try:
+                    position = self.stop_loss_manager.positions.get(ticker)
+                    if not position:
+                        logger.warning(f"{ticker} 포지션 정보 없음")
+                        continue
+
+                    current_price = pyupbit.get_current_price(ticker)
+                    if not current_price:
+                        logger.error(f"{ticker} 현재 가격 가져오기 실패")
+                        continue
+
+                    entry_price = position["entry_price"]
+                    amount = position["amount"]
+                    profit_percent = ((current_price - entry_price) / entry_price) * 100
+                    predicted_price = self.market_analyzer.predict_next_price(ticker)
+
+                    sell_reason = []
+                    should_sell = False
+
+                    if profit_percent >= 10:
+                        sell_reason.append(f"수익률 {profit_percent:.2f}% (목표 10% 초과)")
+                        should_sell = True
+                    elif profit_percent <= -5:
+                        sell_reason.append(f"손실률 {profit_percent:.2f}% (손절 기준 -5% 초과)")
+                        should_sell = True
+
+                    if risk_level >= 7:
+                        sell_reason.append(f"높은 시장 위험 (위험 수준 {risk_level})")
+                        should_sell = True
+                    if predicted_price and current_price and predicted_price < current_price * 0.95:
+                        sell_reason.append(f"예측 가격 하락 ({predicted_price:,.2f}원, 현재가 대비 -5% 이상)")
+                        should_sell = True
+                    if sell_ratio >= 50:
+                        sell_reason.append(f"AI 매도 비율 권장 ({sell_ratio}%)")
+                        should_sell = True
+
+                    if not should_sell:
+                        logger.info(f"{ticker} 매도 조건 미충족: 수익률={profit_percent:.2f}%, 예측가={predicted_price or '없음'}")
+                        continue
+
+                    try:
+                        coin_data = {
+                            "ticker": ticker,
+                            "current_price": float(current_price),
+                            "entry_price": float(entry_price),
+                            "profit_percent": float(profit_percent),
+                            "predicted_price": float(predicted_price) if predicted_price else None,
+                            "market_risk_level": risk_level,
+                            "sell_ratio": float(sell_ratio)
+                        }
+                        response = self.market_analyzer.client.chat.completions.create(
+                            model="gpt-4",
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": """당신은 암호화폐 거래 전문가입니다. 주어진 코인 데이터를 분석하여 매도 사유를 간결한 문자열로 반환하세요. 
+                                    예: "수익률 10% 달성 및 시장 하락 예측". 반드시 50자 이내로 유지하세요."""
+                                },
+                                {
+                                    "role": "user",
+                                    "content": json.dumps(coin_data, default=serialize_numpy)
+                                }
+                            ]
+                        )
+                        reason = response.choices[0].message.content.strip()
+                    except Exception as e:
+                        logger.error(f"{ticker} 매도 사유 생성 실패: {e}")
+                        reason = ", ".join(sell_reason) or "AI 매도 판단"
+
+                    if not rate_limiter.can_make_order():
+                        await asyncio.sleep(0.1)
+                        continue
+
+                    logger.info(f"{ticker} AI 매도 시도: 가격={current_price:,.2f}원, 수량={amount:.8f}개, 사유={reason}")
+                    sell_order = upbit.sell_market_order(ticker, amount)
+
+                    if sell_order and "uuid" in sell_order:
+                        order_uuid = sell_order["uuid"]
+                        order_info = upbit.get_order(order_uuid)
+                        for _ in range(10):
+                            if order_info and order_info["state"] in ["done", "cancel"]:
+                                break
+                            await asyncio.sleep(1)
+                            order_info = upbit.get_order(order_uuid)
+
+                        executed_amount = float(order_info.get("executed_volume", 0)) if order_info else 0
+                        if executed_amount > 0:
+                            executed_price = current_price
+                            await self.trading_history.add_trade(ticker, "sell", executed_price, executed_amount, reason)
+                            self.stop_loss_manager.remove_position(ticker)
+                            if ticker in self.purchased_coins["coins"]:
+                                self.purchased_coins["coins"].remove(ticker)
+                                FileManager.save_json(COINS_FILE, self.purchased_coins)
+
+                            logger.info(f"{ticker} AI 매도 완료: 가격={executed_price:,.2f}원, 수량={executed_amount:.8f}개")
+                            message = (
+                                f"🔴 AI 매도 실행: {ticker}\n"
+                                f"가격: {executed_price:,.2f}원\n"
+                                f"수량: {executed_amount:.8f}개\n"
+                                f"총 금액: {executed_amount * executed_price:,.0f}원\n"
+                                f"수익률: {profit_percent:.2f}%\n"
+                                f"사유: {reason}"
+                            )
+                            await async_send_telegram_message(message)
+                        else:
+                            logger.error(f"{ticker} AI 매도 미체결: {order_info}")
+                    else:
+                        logger.error(f"{ticker} AI 매도 주문 실패: {sell_order or '응답 없음'}")
+                except Exception as e:
+                    logger.error(f"{ticker} AI 매도 전략 실행 실패: {e}")
+        except Exception as e:
+            logger.error(f"AI 매도 전략 전체 실행 실패: {e}", exc_info=True)
+
+    async def check_pending_orders(self):
+        try:
+            for ticker, position in list(self.stop_loss_manager.positions.items()):
+                if position.get('status') != 'pending' or 'order_uuid' not in position:
+                    continue
+
+                order_uuid = position['order_uuid']
+                order_info = upbit.get_order(order_uuid)
+
+                if not order_info:
+                    logger.warning(f"{ticker} 주문 정보 가져오기 실패, UUID: {order_uuid}")
+                    continue
+
+                if order_info['state'] == 'done':
+                    logger.info(f"{ticker} 주문 체결됨")
+
+                    executed_amount = float(order_info['executed_volume'])
+                    avg_price = float(order_info['price'])
+
+                    reason = position.get('reason', 'AI 추천')
+                    await self.trading_history.add_trade(ticker, "buy", avg_price, executed_amount, reason)
+
+                    position['status'] = 'active'
+                    position['entry_price'] = avg_price
+                    position['amount'] = executed_amount
+                    self.stop_loss_manager.positions[ticker] = position
+                    FileManager.save_json(POSITIONS_FILE, self.stop_loss_manager.positions)
+
+                    if ticker not in self.purchased_coins["coins"]:
+                        self.purchased_coins["coins"].append(ticker)
+                        FileManager.save_json(COINS_FILE, self.purchased_coins)
+
+                    take_profit_price = avg_price * 1.10
+                    stop_loss_price = avg_price * 0.95
+
+                    try:
+                        tp_order = upbit.sell_limit_order(ticker, take_profit_price, executed_amount)
+                        if tp_order and 'uuid' in tp_order:
+                            position['take_profit_order_uuid'] = tp_order['uuid']
+                            logger.info(f"{ticker} 익절 주문 설정: {take_profit_price:,.2f}원")
+                    except Exception as e:
+                        logger.error(f"{ticker} 익절 주문 설정 실패: {e}")
+
+                    position['stop_loss_price'] = stop_loss_price
+
+                    self.stop_loss_manager.positions[ticker] = position
+                    FileManager.save_json(POSITIONS_FILE, self.stop_loss_manager.positions)
+
+                    message = (
+                        f"✅ 매수 주문 체결: {ticker}\n"
+                        f"체결가: {avg_price:,.2f}원\n"
+                        f"수량: {executed_amount:.8f}개\n"
+                        f"총 금액: {executed_amount * avg_price:,.0f}원\n"
+                        f"익절가: {take_profit_price:,.2f}원 (+10%)\n"
+                        f"손절가: {stop_loss_price:,.2f}원 (-5%)\n"
+                    )
+                    await async_send_telegram_message(message)
+
+                elif order_info['state'] == 'wait':
+                    logger.info(f"{ticker} 주문 대기 중")
+                elif order_info['state'] == 'cancel':
+                    logger.info(f"{ticker} 주문 취소됨")
+                    del self.stop_loss_manager.positions[ticker]
+                    FileManager.save_json(POSITIONS_FILE, self.stop_loss_manager.positions)
+        except Exception as e:
+            logger.error(f"대기 주문 확인 오류: {e}")
