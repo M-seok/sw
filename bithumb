@@ -1,0 +1,149 @@
+import os
+import sys
+from dotenv import load_dotenv
+import pandas as pd
+import json
+import hmac
+import hashlib
+import time
+import requests
+from datetime import datetime, timedelta
+import telegram
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential
+import threading
+from openai import OpenAI
+import ta
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import MinMaxScaler
+COINS_FILE = "purchased_coins.json"
+TRADE_HISTORY_FILE = "trade_history.json"
+BACKTEST_RESULTS_FILE = "backtest_results.json"
+POSITIONS_FILE = "positions.json"
+CACHE_DIR = "api_cache"
+
+# 캐시 디렉토리 생성
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# API 키 설정
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BITHUMB_API_KEY = os.getenv("BITHUMB_API_KEY")
+BITHUMB_SECRET_KEY = os.getenv("BITHUMB_SECRET_KEY")
+
+def cache_result(expiry_seconds=3600):
+    def decorator(func):
+        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+        def wrapper(*args, **kwargs):
+            cache_key = f"{func.__name__}_{hashlib.md5(str(args).encode() + str(kwargs).encode()).hexdigest()}"
+            cache_file = os.path.join(CACHE_DIR, f"{cache_key}.json")
+            
+            try:
+                if os.path.exists(cache_file):
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cache_data = json.load(f)
+                        if time.time() - cache_data.get('timestamp', 0) < expiry_seconds:
+                            logger.info(f"Using cached result for {func.__name__}")
+                            return cache_data['result']
+            except Exception as e:
+                logger.error(f"Failed to read cache for {func.__name__}: {e}")
+            
+            result = func(*args, **kwargs)
+            
+            try:
+                cache_data = {
+                    'timestamp': time.time(),
+                    'result': result
+                }
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(cache_data, f)
+                logger.info(f"Cached result for {func.__name__}")
+            except Exception as e:
+                logger.error(f"Failed to write cache for {func.__name__}: {e}")
+            
+            return result
+        return wrapper
+    return decorator
+
+    class TradingHistory:
+    def __init__(self):
+        self.history = FileManager.load_json(TRADE_HISTORY_FILE, {"trades": [], "performance": {}})
+    
+    def add_trade(self, ticker, action, price, amount, reason):
+        trade = {
+            "timestamp": datetime.now().isoformat(),
+            "ticker": ticker,
+            "action": action,
+            "price": price,
+            "amount": amount,
+            "reason": reason
+        }
+        self.history["trades"].append(trade)
+        FileManager.save_json(TRADE_HISTORY_FILE, self.history)
+        
+        message = (
+            f"🔄 거래 실행: {ticker}\n"
+            f"유형: {'매수' if action == 'buy' else '매도'}\n"
+            f"가격: {price:,.0f}\n"
+            f"수량: {amount:,.4f}\n"
+            f"사유: {reason}"
+        )
+        send_telegram_message(message)
+    
+    def calculate_performance(self, ticker):
+        if not rate_limiter.can_make_api_call():
+            time.sleep(0.1)
+            return self.calculate_performance(ticker)
+        try:
+            trades = [t for t in self.history["trades"] if t["ticker"] == ticker]
+            if not trades:
+                return None
+            
+            total_invested = sum(t["amount"] * t["price"] for t in trades if t["action"] == "buy")
+            total_returned = sum(t["amount"] * t["price"] for t in trades if t["action"] == "sell")
+            current_price = bithumb.get_current_price(ticker)
+            if current_price is None:
+                logger.error(f"Failed to get current price for {ticker}")
+                return None
+            
+            current_holdings = sum(t["amount"] for t in trades if t["action"] == "buy") - \
+                             sum(t["amount"] for t in trades if t["action"] == "sell")
+            current_value = current_holdings * current_price if current_holdings > 0 else 0
+            
+            return {
+                "total_invested": total_invested,
+                "total_returned": total_returned,
+                "current_holdings": current_holdings,
+                "current_value": current_value,
+                "total_value": total_returned + current_value,
+                "roi": ((total_returned + current_value - total_invested) / total_invested * 100) \
+                    if total_invested > 0 else 0
+            }
+        except Exception as e:
+            logger.error(f"Performance calculation failed for {ticker}: {e}")
+            return None
+class TradingBot:
+    def __init__(self):
+        self.trading_history = TradingHistory()
+        self.stop_loss_manager = StopLossManager()
+        self.market_analyzer = MarketAnalyzer()
+        self.purchased_coins = FileManager.load_json(COINS_FILE, {"coins": [], "last_analysis": {}})
+        self.last_opportunity_scan = 0
+        self.opportunities = []
+if __name__ == "__main__":
+    logger.info("Starting main loop...")
+    while True:
+        try:
+            run_bot()
+            print("\nWaiting for next analysis cycle...")
+            logger.info("Waiting for next cycle...")
+            time.sleep(7200)  # 2시간 대기
+        except Exception as e:
+            print(f"Main loop error: {e}")
+            logger.error(f"Main loop error: {e}")
+            time.sleep(60)
+        
