@@ -1,0 +1,131 @@
+import os
+import sys
+from dotenv import load_dotenv
+import pandas as pd
+import json
+from datetime import datetime, timedelta
+import requests
+import telegram
+from telegram.ext import Application
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential
+import threading
+import hashlib
+import asyncio
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import ta
+
+STOCKS_FILE = "purchased_stocks.json"
+TRADE_HISTORY_FILE = "trade_history.json"
+POSITIONS_FILE = "positions.json"
+CACHE_DIR = "api_cache"
+MIN_USD_BALANCE = 100
+MAX_STOCKS = 5
+
+# 캐시 디렉토리 생성
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# API 키 설정
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+KIS_APP_KEY = os.getenv("KIS_APP_KEY")
+KIS_APP_SECRET = os.getenv("KIS_APP_SECRET")
+KIS_ACCOUNT_NUMBER = os.getenv("KIS_ACCOUNT_NUMBER")
+
+# 한국투자증권 API 설정
+KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
+KIS_TOKEN_URL = f"{KIS_BASE_URL}/oauth2/tokenP"
+TOKEN_FILE = "kis_token.json"
+
+class KISClient:
+    def __init__(self):
+        self.access_token = None
+        self.token_expiry = 0
+        self.load_or_refresh_token()
+
+    def load_or_refresh_token(self):
+        try:
+            if os.path.exists(TOKEN_FILE):
+                with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
+                    token_data = json.load(f)
+                    self.access_token = token_data.get("access_token")
+                    self.token_expiry = token_data.get("expires_at", 0)
+            if time.time() > self.token_expiry - 300:
+                self.refresh_token()
+        except Exception as e:
+            logger.error(f"Token load failed: {e}")
+            self.refresh_token()
+
+def execute_trading_strategy(self):
+        try:
+            if len(self.purchased_stocks["stocks"]) >= MAX_STOCKS:
+                logger.info("Maximum 5 stocks already held, executing DCA")
+                for ticker in self.purchased_stocks["stocks"]:
+                    self.dollar_cost_averaging(ticker)
+                return
+
+            self.get_balance()
+            if self.account_balance < MIN_USD_BALANCE:
+                logger.info(f"Insufficient balance: {self.account_balance} USD")
+                return
+
+            for opp in self.opportunities[:2]:
+                ticker = opp["ticker"]
+                if ticker in self.purchased_stocks["stocks"]:
+                    logger.info(f"{ticker} already held, skipping")
+                    continue
+                if self.trading_history.is_blacklisted(ticker):
+                    logger.info(f"{ticker} blacklisted, skipping: score={opp['score']}, reason={opp['reason']}")
+                    continue
+
+                predicted_price = self.predict_next_price(ticker)
+                current_price = get_current_price(ticker)
+                if not current_price:
+                    logger.warning(f"Failed to get current price for {ticker}")
+                    continue
+
+                if predicted_price and predicted_price > current_price * 1.02:
+                    budget = self.account_balance * 0.1
+                    amount = int(budget // current_price)
+                    if amount > 0 and self.place_limit_order(ticker, "BUY", current_price, amount):
+                        self.trading_history.add_trade(
+                            ticker, "buy", current_price, amount,
+                            f"Predicted rise to {predicted_price:.2f} (Score: {opp['score']})"
+                        )
+                        self.positions[ticker] = {
+                            "entry_price": current_price,
+                            "amount": amount,
+                            "stop_loss": 5,
+                            "take_profit": 10,
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        FileManager.save_json(POSITIONS_FILE, self.positions)
+                        if ticker not in self.purchased_stocks["stocks"]:
+                            self.purchased_stocks["stocks"].append(ticker)
+                            FileManager.save_json(STOCKS_FILE, self.purchased_stocks)
+                        message = (
+                            f"🟢 매수 실행: {ticker}\n"
+                            f"가격: {current_price:.2f}\n"
+                            f"수량: {amount:,}\n"
+                            f"사유: Predicted rise to {predicted_price:.2f}"
+                        )
+                        asyncio.run(async_send_telegram_message(message))
+                        break
+        except Exception as e:
+            logger.error(f"Trading strategy execution failed: {e}", exc_info=True)
+            asyncio.run(async_send_telegram_message(f"⚠️ 매수 전략 오류: {str(e)[:100]}..."))
+if __name__ == "__main__":
+    logger.info("Starting main loop...")
+    while True:
+        try:
+            run_bot()
+            logger.info("Waiting for next cycle...")
+            time.sleep(7200)  # 2시간 대기
+        except Exception as e:
+            logger.error(f"Main loop error: {e}", exc_info=True)
+            time.sleep(60)
